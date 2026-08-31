@@ -5,6 +5,7 @@ import uuid
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
+from redis.exceptions import RedisError
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from app.core.config import settings
@@ -20,27 +21,33 @@ class RequestIdMiddleware(BaseHTTPMiddleware):
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app):
-        super().__init__(app)
-        self.redis = Redis.from_url(settings.redis_url, decode_responses=True)
-
     async def dispatch(self, request: Request, call_next):
         if request.url.path.startswith("/health"):
             return await call_next(request)
+
         identity = request.client.host if request.client else "unknown"
         auth = request.headers.get("authorization")
         if auth:
             identity = f"auth:{hashlib.sha256(auth.encode()).hexdigest()}"
+
         bucket = int(time.time() // 60)
         key = f"rate:{identity}:{bucket}"
+        redis: Redis = request.app.state.redis
+
         try:
-            count = await self.redis.incr(key)
+            count = await redis.incr(key)
             if count == 1:
-                await self.redis.expire(key, 65)
+                await redis.expire(key, 65)
             if count > settings.rate_limit_per_minute:
-                return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"}, headers={"Retry-After": "60"})
-        except Exception:
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Rate limit exceeded"},
+                    headers={"Retry-After": "60"},
+                )
+        except RedisError:
+            # Rate limiting is intentionally fail-open if Redis is unavailable.
             pass
+
         response = await call_next(request)
         response.headers["X-RateLimit-Limit"] = str(settings.rate_limit_per_minute)
         return response
