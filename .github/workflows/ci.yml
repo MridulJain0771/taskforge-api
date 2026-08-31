@@ -4,10 +4,21 @@ on:
   push:
     branches: [master, main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
+    name: Lint, migrate, test and smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+
     services:
       postgres:
         image: postgres:16-alpine
@@ -22,6 +33,7 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+
       redis:
         image: redis:7-alpine
         ports:
@@ -39,12 +51,109 @@ jobs:
       RATE_LIMIT_PER_MINUTE: 1000
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - run: pip install -r requirements-dev.txt
-      - run: ruff check .
-      - run: alembic upgrade head
-      - run: pytest -q
+
+      - name: Install and validate dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+          pip check
+
+      - name: Compile Python source
+        run: python -m compileall -q app
+
+      - name: Run Ruff checks
+        run: ruff check .
+
+      - name: Apply database migrations
+        run: alembic upgrade head
+
+      - name: Run unit tests
+        run: pytest -q tests/unit
+
+      - name: Run integration tests
+        run: pytest -q tests/integration
+
+      - name: Start API and run health smoke tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          uvicorn app.main:app --host 127.0.0.1 --port 8000 > /tmp/taskforge-api.log 2>&1 &
+          API_PID=$!
+          cleanup() {
+            kill "$API_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          READY=0
+          for _ in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:8000/health/live > /dev/null; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            cat /tmp/taskforge-api.log
+            exit 1
+          fi
+
+          curl --fail --silent http://127.0.0.1:8000/health/live | python -m json.tool
+          curl --fail --silent http://127.0.0.1:8000/health/ready | python -m json.tool
+
+  docker:
+    name: Build and smoke-test Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build --tag taskforge-api:ci .
+
+      - name: Verify container uses non-root user
+        shell: bash
+        run: |
+          USER_NAME="$(docker image inspect taskforge-api:ci --format '{{.Config.User}}')"
+          test "$USER_NAME" = "app"
+
+      - name: Start Docker container and smoke-test liveness
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --detach \
+            --name taskforge-api-ci \
+            --publish 8001:8000 \
+            --env JWT_SECRET=ci-secret-key-that-is-longer-than-32-characters \
+            taskforge-api:ci
+
+          cleanup() {
+            docker rm --force taskforge-api-ci > /dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          READY=0
+          for _ in {1..20}; do
+            if curl --fail --silent http://127.0.0.1:8001/health/live > /dev/null; then
+              READY=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            docker logs taskforge-api-ci
+            exit 1
+          fi
+
+          curl --fail --silent http://127.0.0.1:8001/health/live | python -m json.tool
